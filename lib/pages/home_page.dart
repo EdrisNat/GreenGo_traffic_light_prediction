@@ -27,12 +27,14 @@ class _HomePageState extends State<HomePage> {
   bool _isBackendAvailable = false;
   String _connectionStatus = 'Initializing...';
   int _currentPhase = 0;
-  double _distanceToLight = 150.0;
+  double _distanceToLight = 250.0;
+  bool _isTtsSpeaking = false;
+  int? _pendingPhase;
+  bool _pendingNextLight = false;
 
   double _currentSpeed = 0.0;
   double _targetSpeed = 0.0;
   final math.Random _random = math.Random();
-  Timer? _simulationTimer;
 
   final List<String> _mascots = ['None', 'Lighty', 'Arrow', 'RoboRoadie'];
 
@@ -40,12 +42,6 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _initializeApp();
-  }
-
-  @override
-  void dispose() {
-    _simulationTimer?.cancel();
-    super.dispose();
   }
 
   Future<void> _initializeApp() async {
@@ -57,96 +53,114 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _checkBackendConnection() async {
-    const maxAttempts = 5; // Increased attempts
-    Duration delay = const Duration(seconds: 2); // Increased initial delay
+    const maxAttempts = 6;
+    Duration delay = const Duration(milliseconds: 500);
     bool isHealthy = false;
-
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (!mounted) return; 
-      setState(() {
-        _connectionStatus = 'Connecting (attempt $attempt/$maxAttempts)...';
-      });
-
+      if (mounted) {
+        setState(() {
+          _connectionStatus = 'Connecting to AI Model (attempt $attempt/$maxAttempts)...';
+        });
+      }
       isHealthy = await ModelService.checkHealth();
       if (isHealthy) break;
-
-      if (attempt < maxAttempts) {
-        await Future.delayed(delay);
-        // Exponential backoff to give server time to wake up
-        delay *= 2;
-      }
+      await Future.delayed(delay);
+      final int nextMs = ((delay.inMilliseconds * 1.8).clamp(800, 5000)).round();
+      delay = Duration(milliseconds: nextMs);
     }
-
     if (mounted) {
       setState(() {
         _isBackendAvailable = isHealthy;
-        _connectionStatus = isHealthy ? 'Connected to AI Model 🚀' : 'Using Simulation Mode 🔄';
+        _connectionStatus = isHealthy ? 'Connected to AI Model 🚀' : 'Using Simulation Mode 🔄 (offline)';
       });
     }
   }
 
-  void _startSimulation() {
+  void _startSimulation() async {
     if (_isRunning) return;
+
     if (!DataService.isLoaded) {
-      DataService.loadDataset();
+      await DataService.loadDataset();
     }
+
     setState(() {
       _isRunning = true;
     });
-    _simulationTimer = Timer.periodic(Duration(milliseconds: (_simSpeed * 1000).round()), (timer) {
-      if (!_isRunning) {
-        timer.cancel();
-        return;
+
+    while (_isRunning) {
+      final dataPoint = DataService.getNextDataPoint();
+
+      if (mounted) {
+        setState(() {
+          if (_isTtsSpeaking) {
+            _pendingPhase = dataPoint.phaseId;
+          } else {
+            _currentPhase = dataPoint.phaseId;
+          }
+        });
       }
-      _tick();
-    });
-  }
 
-  void _stopSimulation() {
-    if (mounted) {
-      setState(() {
-        _isRunning = false;
-        _simulationTimer?.cancel();
-      });
-    }
-  }
+      final request = PredictionRequest(
+        vehicleCount: dataPoint.vehicleCount.toInt(),
+        pedestrianCount: dataPoint.pedestrianCount.toInt(),
+        secondsToNextChange: dataPoint.secondsToNextChange,
+        elapsedInPhase: dataPoint.elapsedInPhase,
+        weatherRainFlag: dataPoint.weatherRainFlag,
+        phaseId: dataPoint.phaseId,
+        distanceToLight: _distanceToLight,
+      );
 
-  Future<void> _tick() async {
-    final dataPoint = DataService.getNextDataPoint();
+      try {
+        final response = await ModelService.getPrediction(request);
+        _updateSimulationState(response, dataPoint);
+      } catch (e) {
+        print('❌ Error in simulation loop: $e');
+        _simulateFallbackPrediction(dataPoint);
+      }
 
-    if (mounted) {
-      setState(() {
-        _currentPhase = dataPoint.phaseId;
-      });
-    }
-
-    final request = PredictionRequest(
-      vehicleCount: dataPoint.vehicleCount.toInt(),
-      pedestrianCount: dataPoint.pedestrianCount.toInt(),
-      secondsToNextChange: dataPoint.secondsToNextChange,
-      elapsedInPhase: dataPoint.elapsedInPhase,
-      weatherRainFlag: dataPoint.weatherRainFlag,
-      phaseId: _currentPhase,
-      distanceToLight: _distanceToLight,
-    );
-
-    try {
-      final response = await ModelService.getPrediction(request);
-      _updateSimulationState(response, dataPoint);
-    } catch (e) {
-      print('❌ Error in simulation tick: $e');
-      _simulateFallbackPrediction(dataPoint);
+      await Future.delayed(Duration(milliseconds: (_simSpeed * 1000).round()));
     }
   }
 
   void _updateSimulationState(PredictionResponse response, TrafficDataPoint dataPoint) {
-    _targetSpeed = response.recommendedSpeed;
-    _updateVehicleDynamics();
+    final double seconds = dataPoint.secondsToNextChange.clamp(1.0, 300.0);
+    double derivedSpeed = (_distanceToLight / seconds) * 3.6;
+    double maxSpeed;
+    switch (_currentPhase) {
+      case 1: maxSpeed = 40.0; break;
+      case 2: maxSpeed = 50.0; break;
+      default: maxSpeed = 60.0;
+    }
+    derivedSpeed = derivedSpeed.clamp(10.0, maxSpeed);
+
+    final double backendSpeed = response.recommendedSpeed;
+    if (backendSpeed > 0) {
+      _targetSpeed = (0.7 * derivedSpeed) + (0.3 * backendSpeed);
+    } else {
+      _targetSpeed = derivedSpeed;
+    }
+
+    double speedDifference = _targetSpeed - _currentSpeed;
+    double accelerationFactor = 0.2;
+    _currentSpeed += speedDifference * accelerationFactor;
+    _currentSpeed += (_random.nextDouble() - 0.5) * 2.0;
+    _currentSpeed = _currentSpeed.clamp(0.0, 80.0);
+
+    double distanceTraveled = (_currentSpeed / 3.6) * _simSpeed;
+    _distanceToLight -= distanceTraveled;
+
+    if (_distanceToLight <= 0) {
+      if (_isTtsSpeaking) {
+        _pendingNextLight = true;
+      } else {
+        _setupNextLightScenario();
+      }
+    }
 
     if (mounted) {
       setState(() {
         _currentPrediction = PredictionData(
-          secondsToChange: response.secondsToChange,
+          secondsToChange: dataPoint.secondsToNextChange,
           recommendedSpeed: _targetSpeed,
           currentSpeed: _currentSpeed,
           currentPhase: _currentPhase,
@@ -163,65 +177,82 @@ class _HomePageState extends State<HomePage> {
   void _simulateFallbackPrediction(TrafficDataPoint dataPoint) {
     double secondsToChange;
     switch (_currentPhase) {
-      case 0: secondsToChange = 25.0 + _random.nextDouble() * 15.0; break;
-      case 1: secondsToChange = 4.0 + _random.nextDouble() * 2.0; break;
-      case 2: secondsToChange = 40.0 + _random.nextDouble() * 20.0; break;
+      case 0: secondsToChange = 30.0 + _random.nextDouble() * 10.0; break;
+      case 1: secondsToChange = 5.0 + _random.nextDouble() * 2.0; break;
+      case 2: secondsToChange = 45.0 + _random.nextDouble() * 15.0; break;
       default: secondsToChange = 30.0;
     }
 
-    double safeSeconds = math.max(secondsToChange - 3, 2);
+    if (dataPoint.vehicleCount > 5) secondsToChange *= 1.2;
+
+    double safeSeconds = math.max(secondsToChange - 5, 3);
     _targetSpeed = (_distanceToLight / safeSeconds) * 3.6;
-    _targetSpeed = _targetSpeed.clamp(15.0, 55.0);
+    _targetSpeed = _targetSpeed.clamp(20.0, 60.0);
 
     final fallbackResponse = PredictionResponse(
-      secondsToChange: secondsToChange,
-      recommendedSpeed: _targetSpeed,
-      predictionSource: 'fallback_simulation',
-      status: 'success',
+        secondsToChange: secondsToChange,
+        recommendedSpeed: _targetSpeed,
+        predictionSource: 'fallback_simulation',
+        status: 'success',
     );
     _updateSimulationState(fallbackResponse, dataPoint);
-  }
-
-  void _updateVehicleDynamics() {
-    bool isBrakingForRed = _currentPhase == 2 && _distanceToLight < 80;
-    if (isBrakingForRed) {
-      _targetSpeed = _targetSpeed * (_distanceToLight / 80);
-    }
-
-    double speedDifference = _targetSpeed - _currentSpeed;
-    double accelerationFactor = (speedDifference > 0) ? 0.35 : (isBrakingForRed ? 0.2 : 0.1);
-    _currentSpeed += speedDifference * accelerationFactor;
-    _currentSpeed = _currentSpeed.clamp(0.0, 80.0);
-
-    double distanceTraveled = (_currentSpeed / 3.6) * _simSpeed;
-    _distanceToLight -= distanceTraveled;
-
-    if (_distanceToLight <= 0) {
-      _setupNextLightScenario();
-    }
   }
 
   void _setupNextLightScenario({bool isInitial = false}) {
     if (!isInitial) {
       _lightCount++;
-    } else {
-      _currentSpeed = 0.0;
     }
-    _distanceToLight = 80 + _random.nextDouble() * 70; // 80m to 150m
+    _distanceToLight = 200 + _random.nextDouble() * 250;
+    _currentSpeed = math.max(15.0, _currentSpeed * 0.7);
+    _pendingNextLight = false;
+  }
 
-    if (!isInitial) {
-      _currentSpeed = math.max(20.0, _currentSpeed * 0.7);
-    }
+  void _stopSimulation() {
     if (mounted) {
-      setState(() {});
+      setState(() {
+        _isRunning = false;
+      });
     }
   }
 
   void _passLight() {
     if (mounted) {
       setState(() {
-        _setupNextLightScenario();
+        if (_isTtsSpeaking) {
+          _pendingNextLight = true;
+        } else {
+          _setupNextLightScenario();
+        }
       });
+    }
+  }
+
+  void _onMascotSpeakingChanged(bool speaking) {
+    if (!mounted) return;
+    setState(() {
+      _isTtsSpeaking = speaking;
+      if (!speaking) {
+        if (_pendingPhase != null) {
+          _currentPhase = _pendingPhase!;
+          _pendingPhase = null;
+        }
+        if (_pendingNextLight) {
+          _setupNextLightScenario();
+        }
+      }
+    });
+  }
+
+  String _getMascotMessage(double? seconds, double speed) {
+    if (seconds == null) {
+      return "$_selectedMascot says: Waiting for data...";
+    }
+    if (_currentSpeed > speed + 5) {
+        return "$_selectedMascot says: Too fast! Slow to ${speed.toStringAsFixed(0)} km/h.";
+    } else if (_currentSpeed < speed - 5) {
+        return "$_selectedMascot says: Speed up! Aim for ${speed.toStringAsFixed(0)} km/h.";
+    } else {
+        return "$_selectedMascot says: Perfect! Hold this speed.";
     }
   }
 
@@ -282,19 +313,13 @@ class _HomePageState extends State<HomePage> {
                     size: 16,
                   ),
                   const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _connectionStatus,
-                      style: TextStyle(
-                        color: _isBackendAvailable ? Colors.green : Colors.orange,
-                        fontWeight: FontWeight.w500,
-                      ),
-                      textAlign: TextAlign.center,
+                  Text(
+                    _connectionStatus,
+                    style: TextStyle(
+                      color: _isBackendAvailable ? Colors.green : Colors.orange,
+                      fontWeight: FontWeight.w500,
                     ),
                   ),
-                  // NEW: Retry button appears when offline
-                  if (!_isBackendAvailable)
-                    TextButton(onPressed: _checkBackendConnection, child: const Text('Retry')),
                 ],
               ),
             ),
@@ -305,120 +330,126 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   Expanded(
                     flex: 2,
-                    child: Column(
-                      children: [
-                        TrafficLightWidget(
-                          phase: _currentPhase,
-                          isLighty: _selectedMascot == 'Lighty',
-                        ),
-                        const SizedBox(height: 20),
-                        Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: _getPhaseColor(_currentPhase).withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: _getPhaseColor(_currentPhase),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        children: [
+                          TrafficLightWidget(
+                            phase: _currentPhase,
+                            isLighty: _selectedMascot == 'Lighty',
+                          ),
+                          const SizedBox(height: 20),
+                          Container(
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: _getPhaseColor(_currentPhase).withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: _getPhaseColor(_currentPhase),
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceAround,
+                              children: [
+                                _buildPhaseIndicator('GREEN', 0),
+                                _buildPhaseIndicator('YELLOW', 1),
+                                _buildPhaseIndicator('RED', 2),
+                              ],
                             ),
                           ),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceAround,
+                          const SizedBox(height: 20),
+                          Column(
                             children: [
-                              _buildPhaseIndicator('GREEN', 0),
-                              _buildPhaseIndicator('YELLOW', 1),
-                              _buildPhaseIndicator('RED', 2),
+                              LinearProgressIndicator(
+                                value: _currentPrediction != null
+                                    ? (_currentPrediction!.elapsedInPhase / 60).clamp(0.0, 1.0)
+                                    : 0.0,
+                                backgroundColor: Colors.grey[300],
+                                color: _getPhaseColor(_currentPhase),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Elapsed: ${_currentPrediction?.elapsedInPhase.toStringAsFixed(0) ?? "0"}s',
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
                             ],
                           ),
-                        ),
-                        const SizedBox(height: 20),
-                        Column(
-                          children: [
-                            LinearProgressIndicator(
-                              value: _currentPrediction != null
-                                  ? (_currentPrediction!.elapsedInPhase / 60).clamp(0.0, 1.0)
-                                  : 0.0,
-                              backgroundColor: Colors.grey[300],
-                              color: _getPhaseColor(_currentPhase),
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              'Elapsed: ${_currentPrediction?.elapsedInPhase.toStringAsFixed(0) ?? "0"}s',
-                              style: Theme.of(context).textTheme.bodySmall,
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 20),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: FilledButton.icon(
-                                onPressed: _isRunning ? _stopSimulation : _startSimulation,
-                                icon: Icon(_isRunning ? Icons.stop : Icons.play_arrow),
-                                label: Text(_isRunning ? 'Stop Demo' : 'Start Demo'),
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: _isRunning ? Colors.red : Colors.green,
-                                  padding: const EdgeInsets.symmetric(vertical: 16),
+                          const SizedBox(height: 20),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: FilledButton.icon(
+                                  onPressed: _isRunning ? _stopSimulation : _startSimulation,
+                                  icon: Icon(_isRunning ? Icons.stop : Icons.play_arrow),
+                                  label: Text(_isRunning ? 'Stop Demo' : 'Start Demo'),
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: _isRunning ? Colors.red : Colors.green,
+                                    padding: const EdgeInsets.symmetric(vertical: 16),
+                                  ),
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: 10),
-                            IconButton(
-                              onPressed: _passLight,
-                              icon: const Icon(Icons.traffic),
-                              style: IconButton.styleFrom(
-                                backgroundColor: Colors.blue,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.all(16),
+                              const SizedBox(width: 10),
+                              IconButton(
+                                onPressed: _passLight,
+                                icon: const Icon(Icons.traffic),
+                                style: IconButton.styleFrom(
+                                  backgroundColor: Colors.blue,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.all(16),
+                                ),
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                   const SizedBox(width: 20),
                   Expanded(
                     flex: 1,
-                    child: Column(
-                      children: [
-                        MetricsCard(
-                          title: 'Next Change',
-                          value: _currentPrediction?.secondsToChange.toStringAsFixed(1) ?? '--',
-                          unit: 's',
-                          icon: Icons.timer,
-                        ),
-                        const SizedBox(height: 10),
-                        MetricsCard(
-                          title: 'Current Speed',
-                          value: _currentPrediction?.currentSpeed.toStringAsFixed(0) ?? '--',
-                          unit: 'km/h',
-                          icon: Icons.speed,
-                          color: Colors.blue,
-                        ),
-                        const SizedBox(height: 10),
-                        MetricsCard(
-                          title: 'Target Speed',
-                          value: _currentPrediction?.recommendedSpeed.toStringAsFixed(0) ?? '--',
-                          unit: 'km/h',
-                          icon: Icons.assistant_direction,
-                        ),
-                        const SizedBox(height: 10),
-                        MetricsCard(
-                          title: 'Distance',
-                          value: _currentPrediction?.distanceToLight.toStringAsFixed(1) ?? '--',
-                          unit: 'm',
-                          icon: Icons.place,
-                        ),
-                        const Spacer(),
-                        if (_selectedMascot != 'None')
-                          MascotWidget(
-                            mascotName: _selectedMascot,
-                            speed: _currentPrediction?.recommendedSpeed ?? 0,
-                            secondsToChange: _currentPrediction?.secondsToChange,
-                            isSpeaking: _enableVoice,
-                            phase: _currentPhase,
+                    child: SingleChildScrollView(
+                      child: Column(
+                        children: [
+                          MetricsCard(
+                            title: 'Next Change',
+                            value: _currentPrediction?.secondsToChange.toStringAsFixed(1) ?? '--',
+                            unit: 's',
+                            icon: Icons.timer,
                           ),
-                      ],
+                          const SizedBox(height: 10),
+                          MetricsCard(
+                            title: 'Current Speed',
+                            value: _currentPrediction?.currentSpeed.toStringAsFixed(0) ?? '--',
+                            unit: 'km/h',
+                            icon: Icons.speed,
+                            color: Colors.blue,
+                          ),
+                          const SizedBox(height: 10),
+                          MetricsCard(
+                            title: 'Target Speed',
+                            value: _currentPrediction?.recommendedSpeed.toStringAsFixed(0) ?? '--',
+                            unit: 'km/h',
+                            icon: Icons.assistant_direction,
+                          ),
+                          const SizedBox(height: 10),
+                          MetricsCard(
+                            title: 'Distance',
+                            value: _currentPrediction?.distanceToLight.toStringAsFixed(1) ?? '--',
+                            unit: 'm',
+                            icon: Icons.place,
+                          ),
+                          const SizedBox(height: 20),
+                          if (_selectedMascot != 'None')
+                            MascotWidget(
+                              mascotName: _selectedMascot,
+                              speed: _currentPrediction?.recommendedSpeed ?? 0,
+                              secondsToChange: _currentPrediction?.secondsToChange,
+                              isSpeaking: _enableVoice,
+                              phase: _currentPhase,
+                              nextPhaseHint: _currentPhase == 1 ? (_pendingPhase ?? _pendingPhase) : null,
+                              onSpeakingChanged: _onMascotSpeakingChanged,
+                            ),
+                        ],
+                      ),
                     ),
                   ),
                 ],
@@ -564,7 +595,7 @@ class _HomePageState extends State<HomePage> {
                       value: _simSpeed,
                       min: 0.20,
                       max: 1.50,
-                      divisions: 13,
+                      divisions: 26,
                       label: _simSpeed.toStringAsFixed(2),
                       onChanged: (value) {
                         this.setState(() {
